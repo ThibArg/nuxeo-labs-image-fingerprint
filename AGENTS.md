@@ -16,6 +16,7 @@ own image. No image is published.
 | `image-fingerprint/app.py` | FastAPI service: reads the body into memory, runs TrustMark in a thread, returns the image or a JSON result |
 | `image-fingerprint/THIRD-PARTY-NOTICES.md` | Apache-2.0 for this code; licenses of everything the build downloads |
 | `samples/make-sample.py` | Generates `samples/photo.jpg` (synthetic, no third-party content) |
+| `README-Running-at-scale.md` | Tuning: sizing, memory, CPU, replicas, and asynchronous invocation |
 
 The image sources live in `image-fingerprint/`, which is also the Docker build context: the user
 copies that folder next to their `docker-compose.yml`. **Everything the build needs must be inside
@@ -253,6 +254,38 @@ TrustMark version shown in `README.md`.
   `linux_aarch64` at https://download.pytorch.org/whl/cpu, and that `lightning` still allows it
   (it currently requires `torch<4.0,>=2.1.0`).
 - **Everything else**: `docker run --rm --entrypoint pip "$IMAGE" list --outdated`.
+
+## Asynchronous invocation - tested, don't re-litigate from the sources
+
+`README-Running-at-scale.md` documents this. The findings below were **run against a real Nuxeo
+LTS 2025 instance**, and several contradict what the sources suggest, so don't "correct" them by
+reading `AbstractWork` again:
+
+- **A plain Work does not retry.** `AbstractWork.getRetryCount()` returns 0. Only `ListenerWork`
+  (async post-commit listeners, default 2) and BAF stream processors retry.
+- **`ListenerWork` retries have no backoff.** Measured: 3 attempts (1 + 2 retries) spread over
+  **48 ms**. They cannot ride out a restart of the fingerprint service. Raising `retryCount` adds
+  attempts, not delay, so it does not help.
+- **`Bulk.RunAction` with the stock `automation` action does not retry either**: `failOnError`
+  defaults to `false`, so the error is recorded and swallowed and the `maxRetries` policy never
+  fires. Measured: `COMPLETED processed=1 errorCount=1`, service never contacted.
+- **BAF with `<option name="failOnError">true</option>` does work.** Measured: submitted with the
+  service down, service started 2 s later, command recovered and completed with `errorCount=0` after
+  ~7 s of backoff. This is the only configuration that survived an outage.
+- **Nothing survives a Nuxeo restart without Kafka**, and it fails *silently*: measured, an in-flight
+  bulk command was still reporting `state=RUNNING processed=0` sixty seconds after the restart, with
+  the service healthy and never contacted. `nuxeo.stream.work.enabled` defaults to
+  `${kafka.enabled}` = false.
+- **`ConversionService.scheduleConversion` is a trap**: `ConversionWork` has 0 retries and
+  `ConversionStatus` has no FAILED state, so a failure is indistinguishable from "still running".
+- **Contributions in `nxserver/config/` must be named `*-config.xml` or `*-bundle.xml`**
+  (`OSGiRuntimeService`). Any other name is silently ignored - no error, no warning.
+- The conversion cache is **not** an idempotency guarantee: node-local, 10 MiB by default, cleared on
+  restart. It did mask a stopped service during testing, which is exactly why it should not be relied
+  on.
+- Not tested, and labelled as such in the doc: the dead letter queue and its replay via
+  `WorkManager.RunWorkInFailure`, and saving the fingerprinted blob back on the document (the test
+  chain only logged, which sidesteps re-entrancy).
 
 ## Out of scope
 

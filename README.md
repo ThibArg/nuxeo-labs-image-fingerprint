@@ -381,6 +381,7 @@ token-to-recipient mapping belongs in Nuxeo, not in container logs.
 | `image-fingerprint/THIRD-PARTY-NOTICES.md` | Licensing of everything the build downloads (summary: all permissive). |
 | `samples/photo.jpg` | A generated test image, so the `curl` examples run out of the box. |
 | `samples/make-sample.py` | Regenerates it. |
+| `README-Running-at-scale.md` | Tuning: memory budget, host sizing, CPU, replicas, and calling the service asynchronously. |
 
 The `image-fingerprint/` folder is the Docker build context and is self-contained: `samples/` and
 `README.md` stay at the repository root and are not part of the image.
@@ -402,212 +403,25 @@ how large an image must it accept?
   to use ~1.6 cores no matter how many you give it.
 - **Don't forget the neighbours.** Nuxeo, MongoDB and OpenSearch share the host. Budget fingerprinting
   *on top of* them, not inside their headroom.
+- **Synchronous is usually the right answer.** `Blob.RunConverter` runs inside the caller's
+  transaction, and an embed takes well under a second. Only go asynchronous if the fingerprinting
+  must not be able to fail the operation that triggered it - and read
+  [the async section](README-Running-at-scale.md#calling-it-asynchronously) first, because the
+  obvious route does **not** give you usable retries.
 
-> [!IMPORTANT]
-> **The figures in this section are estimates, not benchmarks.** They were taken on a development
-> machine - Docker Desktop on an arm64 laptop, 8 CPUs allocated to the Docker VM, one container at a
-> time, synthetic test images, and no Nuxeo load running alongside. They show the *shape* of the problem
-> (memory grows with pixels, CPU barely helps) and give orders of magnitude to plan with. Absolute
-> numbers will differ on x86_64 server hardware, with real photographs, and under concurrent load - the
-> timings in particular will not transfer from arm64 to x86_64. The memory relationship is the one that
-> travels best, because it is driven by array sizes rather than by the CPU. **Measure on your own target
-> before committing to a size.**
+> [!NOTE]
+> The sizing figures quoted here are estimates from a development machine, not benchmarks.
+> [README-Running-at-scale.md](README-Running-at-scale.md) has the full numbers, the method and the
+> caveats. Measure on your own target before committing to a size.
 
-### Sizing the host
+### Sizing, memory, CPU and scaling out
 
-*Estimates from a development machine, not benchmarks - see the note above. The Nuxeo-side figures
-below are a measured idle floor plus an explicitly flagged projection.*
+The defaults are sized for a 30 MP ceiling with one conversion at a time, which suits a presales
+demo and most production installations. When they stop fitting, see
+**[README-Running-at-scale.md](README-Running-at-scale.md)**: the memory budget and host sizing
+examples, what the CPU and thread limits are actually made of, how to scale with replicas (and why
+not with uvicorn workers), and how to call the service asynchronously with retries.
 
-Start from the memory budget, because that is what fails hard:
-
-```
-per container  ~=  450 MB  +  MAX_CONCURRENT x 90 bytes x MAX_PIXELS
-```
-
-| `MAX_PIXELS` | Typical source | Peak per container | Suggested `mem_limit` |
-|---|---|---|---|
-| 30 MP (default) | 60 Mpx-class camera, large scans | ~2.7 GB | `4g` |
-| 12 MP | Most phone photos | ~1.5 GB | `2g` |
-| 8 MP | Web/press-sized images | ~1.2 GB | `2g` |
-
-Then add what Nuxeo itself needs. For reference, a **development** stack sitting completely idle:
-
-| Container | Idle memory |
-|---|---|
-| Nuxeo | ~1.2 GB |
-| OpenSearch (`-Xmx512m`) | ~1.3 GB |
-| MongoDB | ~0.1 GB |
-| OpenSearch Dashboards | ~0.2 GB |
-| **Total, idle** | **~2.7 GB** |
-
-That is a **floor, measured at rest**. Under real load Nuxeo's heap and OpenSearch's caches grow well
-past it; a working estimate of 6-8 GB for the Nuxeo side is more realistic, but that figure is a
-projection, not something measured here.
-
-Putting the two together, for a host shared with Nuxeo:
-
-| Host | Nuxeo side (estimated, under load) | Left over | Realistic fingerprinting capacity |
-|---|---|---|---|
-| 4 vCPU / 16 GB (e.g. `t3.xlarge`) | ~7 GB, 2-3 vCPU | ~8 GB, 1-2 vCPU | **1 replica** at `mem_limit: 4g`, `cpus: 2`. Fine for occasional fingerprinting; CPU-contended for bulk runs |
-| 8 vCPU / 32 GB (e.g. `m5.2xlarge`) | ~7 GB, 2-3 vCPU | ~24 GB, 5 vCPU | **2-3 replicas** comfortably |
-| 4 vCPU / 16 GB, `MAX_PIXELS=8000000` | ~7 GB | ~8 GB | **2-3 replicas** at `mem_limit: 2g` - the same box, by accepting smaller images |
-
-The last row is the point worth taking away: **lowering `MAX_PIXELS` buys more capacity than buying a
-bigger instance**, as long as your images really are that size. A 30 MP ceiling on a library of 12 MP
-photos reserves memory that is never used.
-
-### Memory
-
-*Estimates from a development machine, not benchmarks - see the note above.*
-
-Peak container memory, embedding one image at a time:
-
-| Image | Peak container memory |
-|---|---|
-| idle, model loaded | ~450 MB |
-| 1 MP (1200x800) | ~630 MB |
-| 12 MP | ~1.5 GB |
-| 24 MP | ~2.5 GB |
-| 30 MP (the `MAX_PIXELS` default) | ~2.7 GB |
-
-Rule of thumb: **~450 MB plus about 90 bytes per pixel**. TrustMark upsamples the watermark residual to
-full resolution as `float32`, then mixes it with the cover image as `float64`, so the cost is driven by
-the pixel count, not by the file size. A 3 MB JPEG and a 3 MB PNG of very different dimensions cost
-very different amounts of memory.
-
-This is why `mem_limit` is `4g`. With `2g`, a 30 MP image gets the container **OOM-killed**: the client
-sees a dropped connection, not a clean error, and every other request in that container dies with it.
-If you raise `MAX_PIXELS`, raise `mem_limit` with it.
-
-### CPU and threads
-
-*Estimates from a development machine, not benchmarks - see the note above. The timings in particular
-are arm64 and will not transfer to x86_64; the relative shape is what matters here.*
-
-`TORCH_THREADS` and `cpus` matched, median of 5 runs:
-
-| `cpus` = `TORCH_THREADS` | 24 MP embed | 1 MP embed | 24 MP decode |
-|---|---|---|---|
-| 1 | 0.99 s | 0.38 s | 0.25 s |
-| 2 | 0.65 s | 0.18 s | 0.17 s |
-| 4 | 0.57 s | 0.13 s | 0.16 s |
-| 8 | 0.53 s | 0.10 s | 0.17 s |
-
-Eight times the CPU buys **1.9x** on a 24 MP image, but **3.6x** on a 1 MP one. That looks backwards
-until you see where the time goes:
-
-- The model always runs on a **fixed 256x256 tensor**, whatever the input size. That part is PyTorch,
-  parallelises well, and dominates *small* images.
-- The full-resolution work - upsampling the residual and mixing it into the cover - grows with the pixel
-  count, and a large part of it is single-threaded NumPy arithmetic. That dominates *large* images and
-  does not parallelise.
-
-Measuring the cores actually used during a sustained loop, with 8 threads and no CPU limit, confirms it:
-
-| Workload | CPU actually used |
-|---|---|
-| 24 MP embeds | ~1.6 cores |
-| 1 MP embeds | ~3.9 cores |
-
-So on large images the service cannot use more than about 2 cores however many you give it.
-**`cpus: 2` is the sweet spot**; beyond that you are paying for capacity the process cannot consume.
-
-Setting `TORCH_THREADS` higher than the CPU quota is mildly counter-productive - at `cpus: 2`:
-
-| `TORCH_THREADS` at `cpus: 2` | 24 MP embed |
-|---|---|
-| 1 | 0.81 s |
-| 2 | 0.66 s |
-| 4 | 0.66 s |
-| 8 | 0.68 s |
-
-Match `TORCH_THREADS` to `cpus` and leave it there.
-
-### Scaling out: replicas, not workers or threads
-
-There are three things you could turn up, and only one of them is the right answer:
-
-| Knob | What it does | Verdict |
-|---|---|---|
-| `TORCH_THREADS` | More cores on **one** image | Small, sub-linear gain. Match it to `cpus` |
-| `uvicorn --workers N` | N processes in **one** container | **Don't** - see below |
-| Replicas | N separate containers | **This one** |
-
-**Why not workers.** uvicorn starts workers with the `spawn` multiprocessing context, so each worker is
-a fresh interpreter that re-imports `app.py` and builds **its own copy of the model**. There is no
-copy-on-write sharing. Four workers cost ~1.8 GB of model before a single request arrives, all inside
-the *same* `mem_limit`.
-
-Worse, `MAX_CONCURRENT` is a **per-process** semaphore. Four workers each holding `MAX_CONCURRENT=1`
-means four conversions at once, so the limit you set to protect memory quietly stops doing so:
-
-```
-4 workers x 30 MP x ~90 bytes/pixel  ~=  9 GB   inside a 4 GB container
-```
-
-And the blast radius is wrong: the OOM killer acts on the **cgroup**, which is the whole container, so
-the three healthy requests on the other workers die alongside the one that overran.
-
-**Why replicas.** Each container is its own cgroup with its own `mem_limit`, so the budget is *per
-replica*. `MAX_CONCURRENT=1` keeps meaning what you sized it to mean: one image in flight, one memory
-ceiling. An OOM kills one replica, the others keep serving, and `restart: unless-stopped` brings it
-back - one failed request instead of four.
-
-```yml
-  image-fingerprint:
-    build:
-      context: ./image-fingerprint
-    image: image-fingerprint
-    # no "hostname:" and no "container_name:" when scaling - the service name is what resolves
-    restart: unless-stopped
-    expose:
-      - 8080
-    mem_limit: 4g
-    cpus: 2
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    volumes:
-      - image-fingerprint-tmp:/tmp
-    deploy:
-      replicas: 3
-```
-
-`docker compose up -d --scale image-fingerprint=3` does the same thing without touching the file.
-
-**No load balancer is needed.** Docker's embedded DNS resolves the service name to all replica
-addresses and shuffles them, so successive lookups land on different containers. Every Nuxeo conversion
-is a fresh, short-lived `curl` process doing a fresh DNS lookup, so the load spreads by itself. Verified
-with two replicas: consecutive calls to `http://image-fingerprint:8080/health` alternated between
-`172.20.0.2` and `172.20.0.3`.
-
-Two caveats. The shuffle is **not load-aware** - there is no least-connections logic, so a request can
-land on a busy replica while another sits idle. And this works *because* `curl` is short-lived; a client
-with a persistent connection pool would pin itself to one replica and need a real balancer.
-
-**What a replica buys.** Six concurrent 1 MP requests, `MAX_CONCURRENT=1`, `cpus: 2` each:
-
-| | Request completion times | Wall clock |
-|---|---|---|
-| 1 replica | 0.22, 0.42, 0.62, 0.82, 1.03, 1.21 s | 1.26 s |
-| 2 replicas | 0.22, 0.26, 0.48, 0.51, 0.70, 0.70 s | 0.75 s |
-
-The single-replica staircase, one step of ~0.2 s per request, *is* `MAX_CONCURRENT=1` doing its job:
-requests queue rather than compete for memory. A single request takes 0.23 s, so the sixth one spent
-about a second waiting before it even started.
-
-That queueing is why the timeout chain matters. `CONVERT_TIMEOUT_S` only starts counting **once a
-request gets a slot**, so the wait does not count against it - but it does count against
-`curl --max-time 80`. Roughly:
-
-```
-queue wait  ~=  (position in queue - 1)  x  per-image time
-```
-
-At ~0.66 s per 24 MP image, one replica absorbs a burst of roughly 120 queued requests before the
-client's 80 s deadline is at risk. Past that, add replicas rather than stretching the timeouts.
 
 ### Security
 
@@ -699,8 +513,14 @@ The port is published on `127.0.0.1` only, for this test. In a real deployment, 
   checksum check at startup would try to re-download it, fail on the read-only filesystem, and the
   container would restart-loop. Rebuild the image in that case.
 - **Scaling and sizing**: the service is memory-bound, not CPU-bound, and scales by adding replicas
-  rather than uvicorn workers or threads. See [Running in production](#running-in-production) for the
-  memory budget, host sizing and the measurements behind that.
+  rather than uvicorn workers or threads. See
+  [README-Running-at-scale.md](README-Running-at-scale.md) for the memory budget, host sizing and the
+  measurements behind that.
+- **Asynchronous calls need care**: an async post-commit handler retries twice, but with **no
+  backoff** - all attempts are spent within milliseconds, so they do not survive a restart of this
+  service. The Bulk Action Framework does, but only with `failOnError` enabled, and nothing survives a
+  Nuxeo restart unless Kafka is enabled. All tested, see
+  [Calling it asynchronously](README-Running-at-scale.md#calling-it-asynchronously).
 
 
 ## Support
