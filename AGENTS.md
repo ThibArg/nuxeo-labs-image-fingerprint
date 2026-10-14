@@ -91,7 +91,19 @@ not work. `samples/` and `README.md` stay at the root and are not part of the im
   explicit `width * height > MAX_PIXELS` test runs after `Image.open()` (header only) and before
   `load()`, so an oversized image is rejected before any pixel is decoded.
 - **`MAX_CONCURRENT=1`**: all requests share one model instance. Scale with replicas, not workers or
-  threads.
+  threads. Two reasons, both measured and written up in the README's "Running in production":
+  - **Never suggest `uvicorn --workers N`.** uvicorn spawns workers with the `spawn` multiprocessing
+    context (`uvicorn/_subprocess.py`), so each worker re-imports `app.py` and builds its **own** copy
+    of the model - no copy-on-write sharing. Worse, `MAX_CONCURRENT` is a *per-process* semaphore, so
+    N workers allow N simultaneous conversions inside a single `mem_limit`, silently defeating the
+    memory guard. The OOM killer then acts on the whole cgroup, taking the healthy requests with it.
+  - **More CPU barely helps.** The model always runs on a fixed 256x256 tensor, so it is the
+    full-resolution NumPy mixing that dominates large images, and that is largely single-threaded.
+    Measured: 8 cores give only 1.9x on a 24 MP image (but 3.6x on a 1 MP one, where the model
+    dominates), and a 24 MP embed only manages to use ~1.6 cores. `cpus: 2` with `TORCH_THREADS=2` is
+    the sweet spot; setting `TORCH_THREADS` above the CPU quota is slightly counter-productive.
+- **Memory budget**: `450 MB + MAX_CONCURRENT x 90 bytes x MAX_PIXELS`. `MAX_CONCURRENT` and
+  `MAX_PIXELS` multiply, so they can only be raised against each other within one `mem_limit`.
 - **Timeout accounting**: `CONVERT_TIMEOUT_S` is armed *after* the request acquires the semaphore
   (`run()` in `app.py`), not when it arrives. A request queued behind others can therefore take
   longer than `CONVERT_TIMEOUT_S` wall-clock, which is why the client timeout has to be the larger
