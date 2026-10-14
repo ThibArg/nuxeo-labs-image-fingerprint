@@ -3,7 +3,7 @@
 #
 # image-fingerprint: HTTP service embedding and reading an invisible TrustMark watermark in an image.
 # Third-party components downloaded by this build and their licenses: see THIRD-PARTY-NOTICES.md
-# Debian-based, like ifc-converter. Builds for the host architecture (arm64 on a Mac, x86_64 on EC2).
+# Debian-based. Builds for the host architecture (arm64 on a Mac, x86_64 on EC2).
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

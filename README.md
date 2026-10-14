@@ -16,6 +16,9 @@ nuxeo-labs-image-fingerprint
   themselves. It survives re-compression, resizing and format conversion, and it is not metadata, so it
   does not disappear when a tool strips EXIF.
 
+> [!IMPORTANT]
+> Metadata is lost: The image is re-encoded, so EXIF and the ICC profile are dropped.
+
 * You build yourself a Docker image ("image-fingerprint") and deploy a container alongside Nuxeo (The Nuxeo
   image is never modified.)
 
@@ -35,9 +38,9 @@ nuxeo-labs-image-fingerprint
   * Never give it a `ports:` mapping in production
   * Only the containers of the compose network must reach it.
 
-* Unlike the sibling `nuxeo-labs-ifc-converter`, every component in this image is permissively licensed
-  (MIT / BSD / Apache-2.0). There is **no restriction on redistributing the built image** beyond the
-  ordinary Debian base-image attribution. See [Licenses](#licenses).
+* **Licensing**: Every component in this image is permissively licensed (MIT / BSD / Apache-2.0). There is
+  **no restriction on redistributing the built image** beyond the ordinary Debian base-image attribution.<br/>
+  See [Licenses](#licenses).
 
 ## Build-Deploy
 
@@ -144,7 +147,7 @@ This is enough because the payload is meant to be a **token**, not data: store t
 alongside the document id, the recipient, the date, and look it up when you decode. 8 characters of
 `A-Z0-9` is about 2.8 x 10^12 combinations.
 
-### 4. `curl` examples (from the Nuxeo container)**
+### 4. `curl` examples (from the Nuxeo container)
 
 ```bash
 # Fingerprint
@@ -175,9 +178,8 @@ Errors come back as plain text explaining the problem. Use `--fail-with-body` so
 
 ## Usage with Nuxeo
 
-Nuxeo needs contributions to three services:
+Nuxeo needs contributions to two services:
 
-* The Mime-Type service (only to name the `/decode` rendition `.json` reliably)
 * The CommandLine service
 * And the converter service
 
@@ -188,29 +190,7 @@ in a single contribution if you prefer
 > Conversions are cached by Nuxeo on the blob plus the parameters: fingerprinting the same image twice with the same
 > token runs `curl` only once (as long as the file is still in the cache).
 
-### 1. Register the mime type for the decode result
-
-`application/json` is **not** in Nuxeo's default mime type registry. Without this, the JSON rendition
-produced by `fingerprint-decode` falls back to `application/octet-stream`, which has no registered
-extension, and the file ends up named from the temp file rather than from the source document.
-
-```xml
-<extension target="org.nuxeo.ecm.platform.mimetype.service.MimetypeRegistryService" point="mimetype">
-  <mimetype normalized="application/json" binary="false" iconPath="file.png">
-    <mimetypes>
-      <mimetype>application/json</mimetype>
-    </mimetypes>
-    <extensions>
-      <extension>json</extension>
-    </extensions>
-  </mimetype>
-</extension>
-```
-
-`image/jpeg` and `image/png` are already registered by the platform, so the embed converters need nothing.
-`image/webp` is **not** registered: if you add a WebP command line, contribute it the same way.
-
-### 2. Register the command lines
+### 1. Register the command lines
 
 The `image-fingerprint` HTTP service is not multipart, so everything must be passed in one shot as query parameters (can't use `-F` switch of `curl`for example).
 
@@ -264,6 +244,20 @@ Points that matter:
 - `enabled="true"` is **required**: the default is `false` and the command would be silently ignored.
 - `-o #{outDirPath}/nxblob-fingerprinted...etc..` is **required** too: Without it, the `CommandLineConverter`
    lists the content of `outDirPath`, turning every file found there into a result blob.
+- **The extension you put on the `-o` file name is load-bearing.** The `nxblob-` prefix marks the name as a
+   throwaway temp name, so Nuxeo renames the rendition to the source document's base name plus *either* the
+   first extension registered for the `<destinationMimeType>`, *or* - when that mime type declares none - the
+   extension of the `-o` file name (`ConversionServiceImpl.updateResultBlobFileName`):
+
+  | `<destinationMimeType>` | In Nuxeo's registry? | `photo.jpg` becomes | Comes from |
+  |---|---|---|---|
+  | `image/jpeg` | yes (`jpg`, `jpeg`) | `photo.jpg` | the registry |
+  | `image/png` | yes (`png`) | `photo.png` | the registry |
+  | `application/json` | no | `photo.json` | the `-o` name |
+  | `image/webp` | no | `photo.webp` | the `-o` name |
+
+  So give `-o` the right extension and all four come out correct - **no mime type contribution is needed**,
+  not even for `application/json` and `image/webp`, which the platform does not register.
 - `--fail-with-body` keeps the service's plain-text error; plain `-f` would throw it away.
 - `-H "Expect:"` avoids curl's 100-continue handshake on large bodies.
 - **The timeouts form a chain, keep them in this order**:
@@ -291,9 +285,7 @@ Points that matter:
 > `--max-time` before the service even begins converting. If that happens, raise `MAX_CONCURRENT` (and the
 > container's CPU/memory) rather than just stretching the timeouts.
 
-### 3. Register the Converters
-
-(A reminder that the mimetypes must have been contributed)
+### 2. Register the Converters
 
 ```xml
 <extension target="org.nuxeo.ecm.core.convert.service.ConversionServiceImpl" point="converter">
@@ -333,16 +325,12 @@ Points that matter:
 </extension>
 ```
 
-### 4. Call it from Automation: `Blob.RunConverter`
+### 3. Call it from Automation: `Blob.RunConverter`
 
 In all the examples, `imageBlob` holds the image, mainly jpeg or png ((maybe a simple prior call to `imageBlob = input["file:content"];`).
 
 > [!WARNING]
-> `parameters` **must be a `key=value` string**, never a JavaScript object.
-> `{'parameters': {'payload': 'K7Q2M9XA'}}` fails silently: the map arrives empty and `#{payload}` is
-> never substituted. `curl` then treats the leftover `#` as a URL fragment delimiter and sends
-> `payload=` empty, so the call comes back as `400 payload must be 1 to 8 characters, A-Z and 0-9 only`.
-> Use `{'parameters': 'payload=K7Q2M9XA'}`. For several parameters, separate them with `\n`.
+> `parameters` **must be a `key=value` string**, never a JavaScript object. This could change in future version of Nuxeo.
 
 ```js
 // Embed

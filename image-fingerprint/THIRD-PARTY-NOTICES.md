@@ -64,10 +64,6 @@ Nuxeo, creates no copyleft obligation. **Every Python and ML component above is 
 (MIT / BSD / Apache-2.0 / PSF), and none of them is GPL, LGPL or AGPL. `tqdm` is MPL-2.0, which is
 file-level copyleft and is not triggered by merely using the library.
 
-This is the practical difference with the sibling `nuxeo-labs-ifc-converter` project, whose image
-contains LGPL components (IfcOpenShell, Open CASCADE) and therefore cannot be redistributed without
-a source offer.
-
 ## If you distribute the built image
 
 The Python layer imposes only attribution: keep the license texts that ship in each

@@ -50,9 +50,9 @@ not work. `samples/` and `README.md` stay at the root and are not part of the im
 - **No sensitive information** in any file: no secrets, tokens, internal URLs or hostnames, personal
   paths, user names, customer or prospect names.
 - **Licenses**: no AGPL dependency, and keep the whole Python layer permissive (MIT / BSD /
-  Apache-2.0 / PSF). This is a selling point of this image over `nuxeo-labs-ifc-converter` and it is
-  stated in `README.md`: a new GPL/LGPL dependency would invalidate that claim. Update
-  `THIRD-PARTY-NOTICES.md` whenever what the image contains changes.
+  Apache-2.0 / PSF). This is a selling point of this image and it is stated in `README.md`: a new
+  GPL/LGPL dependency would invalidate that claim. Update `THIRD-PARTY-NOTICES.md` whenever what the
+  image contains changes.
 - **Stable API**: Nuxeo integrations depend on
   `POST /embed?payload=<1-8 A-Z0-9>[&format=jpeg|png|webp][&strength=0.5-2.0]`, `POST /decode`,
   the raw request body, the content types, the status codes (400, 413, 500, 504) and plain-text
@@ -251,11 +251,17 @@ TrustMark version shown in `README.md`.
   - `enabled="true"`: the default is `false` and the command is silently ignored.
   - `-o #{outDirPath}/nxblob-fingerprinted.<ext>`: without `-o`, `CommandLineConverter` lists
     `#{outDirPath}` and turns **every** file it finds there into a result blob. The `nxblob-` prefix
-    makes Nuxeo rename the rendition to the source base name plus the *first extension registered for
-    the destination mime type* (`ConversionServiceImpl.updateResultBlobFileName`).
-  - `application/json` is **not** in Nuxeo's default mime type registry, hence the contribution in
-    `README.md`; without it the decode rendition falls back to `application/octet-stream`.
-    `image/webp` is not registered either.
+    marks the name as a throwaway temp name, so `ConversionServiceImpl.updateResultBlobFileName`
+    renames the rendition to the source base name plus *either* the first extension registered for
+    the `<destinationMimeType>`, *or* - when that mime type declares none - the extension of the
+    `-o` file name. The `<ext>` in `-o` is therefore load-bearing for unregistered mime types.
+  - `application/json` and `image/webp` are **not** in Nuxeo's default mime type registry. That is
+    harmless and needs **no** contribution: the registry lookup falls back to the
+    `application/octet-stream` entry, which declares no extension (`nxmimetype-service.xml`), so the
+    name falls back to the `-o` extension and still comes out `photo.json` / `photo.webp`. Note it
+    is the *lookup* that falls back, not the blob: `updateResultBlobMimeType` sets the blob's own
+    mime type from `<destinationMimeType>` regardless of registration. `README.md` used to carry a
+    mime type contribution justified by the opposite claim; it was wrong and has been removed.
   - `Blob.RunConverter` `parameters` must be a `key=value` **string**. A JavaScript object is
     silently dropped: `DocumentScriptingWrapper.computeProperties` fills
     `DataModelProperties.properties` while `RunConverter.propertiesToMap` iterates the `HashMap`
