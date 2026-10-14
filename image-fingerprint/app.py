@@ -31,9 +31,14 @@ TORCH_THREADS = int(os.environ.get("TORCH_THREADS", "2"))
 TM_MODEL = os.environ.get("TM_MODEL", "Q")          # Images encoded with one variant can't be decoded with another
 DEFAULT_STRENGTH = float(os.environ.get("TM_STRENGTH", "1.0"))
 MIN_SIDE = int(os.environ.get("MIN_SIDE", "150"))   # TrustMark needs about 150 px on the shortest side
-MAX_PIXELS = int(os.environ.get("MAX_PIXELS", "100000000"))
+# Measured peak for one embed: about 450 MB idle plus ~90 bytes per pixel. TrustMark upsamples the
+# watermark residual to full resolution as float32, then mixes it with the cover image as float64.
+# 30 MP peaks at ~2.7 GB, which is why the README suggests mem_limit 4g; at 2g it is OOM-killed.
+MAX_PIXELS = int(os.environ.get("MAX_PIXELS", "30000000"))
 
-# Default TrustMark error correction (BCH_5) leaves 61 bits = 8 characters in text mode.
+# TrustMark carries a 100-bit payload. The default BCH_5 schema spends 35 bits on error correction
+# and 4 on the schema version, leaving 61 bits of data. Text mode packs 7 bits per character, so
+# 8 characters (56 bits) fit and 9 (63 bits) do not.
 # Uppercase + digits only: safe in a URL and on a command line, no encoding needed.
 PAYLOAD_RE = re.compile(r"^[A-Z0-9]{1,8}$")
 
@@ -43,9 +48,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("image-fingerprint")
 
 torch.set_num_threads(TORCH_THREADS)
-Image.MAX_IMAGE_PIXELS = MAX_PIXELS  # decompression-bomb guard
+Image.MAX_IMAGE_PIXELS = MAX_PIXELS  # decompression-bomb guard, see open_image() for the real limit
 
-TM = TrustMark(verbose=False, model_type=TM_MODEL)
+# loadRemover=False: the remover model (trustmark_rm_Q.ckpt, 77 MB) only serves remove_watermark(),
+# which this service never calls. The Dockerfile pre-downloads the weights with the same flag, so
+# nothing is fetched here. That matters: the container runs on a read-only filesystem.
+TM = TrustMark(verbose=False, model_type=TM_MODEL, loadRemover=False)
 TM_VERSION = version("trustmark")
 
 app = FastAPI(title="image-fingerprint")
@@ -77,11 +85,22 @@ async def read_body(request):
 def open_image(data):
     try:
         img = Image.open(io.BytesIO(data))
-        img.load()
     except Image.DecompressionBombError:
-        raise ConversionError(413, f"image larger than {MAX_PIXELS} pixels")
+        raise ConversionError(413, f"image larger than the {MAX_PIXELS:,} pixel limit")
     except (UnidentifiedImageError, OSError):
         raise ConversionError(400, "not a supported image (JPEG, PNG, WebP, TIFF...)")
+    # Image.open() only reads the header, so the size is known before any pixel is decoded.
+    # Pillow's own bomb guard only fires above 2 x MAX_IMAGE_PIXELS; this check is what actually
+    # enforces MAX_PIXELS, and it rejects the request before load() allocates anything.
+    width, height = img.size
+    if width * height > MAX_PIXELS:
+        raise ConversionError(413, f"image is {width}x{height}, over the {MAX_PIXELS:,} pixel limit")
+    try:
+        img.load()
+    except Image.DecompressionBombError:
+        raise ConversionError(413, f"image larger than the {MAX_PIXELS:,} pixel limit")
+    except (UnidentifiedImageError, OSError):
+        raise ConversionError(400, "truncated or corrupt image file")
     img = ImageOps.exif_transpose(img)  # watermark the image as it is displayed
     if min(img.size) < MIN_SIDE:
         raise ConversionError(400, f"image too small: shortest side must be at least {MIN_SIDE} px")
