@@ -1,0 +1,4 @@
+trustmark
+fastapi
+uvicorn
+pillow

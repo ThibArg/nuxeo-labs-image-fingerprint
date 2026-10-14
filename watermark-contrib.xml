@@ -1,0 +1,48 @@
+<!-- Timeout chain: CONVERT_TIMEOUT_S (60) < curl max-time (80) < <timeout> (90s) < transaction timeout -->
+<extension target="org.nuxeo.ecm.platform.commandline.executor.service.CommandLineExecutorComponent"
+            point="command">
+
+  <!-- Requires the "payload" parameter: 1 to 8 chars, A-Z 0-9 -->
+  <command name="fingerprint-embed-jpeg" enabled="true">
+    <commandLine>curl</commandLine>
+    <parameterString>-sS --fail-with-body --max-time 80 -H "Expect:" -o #{outDirPath}/nxblob-fingerprinted.jpg --data-binary @#{sourceFilePath} "http://image-fingerprint:8080/embed?format=jpeg&amp;payload=#{payload}"</parameterString>
+    <timeout>90s</timeout>
+    <installationDirective>
+      Start the "image-fingerprint" service and make sure it is reachable at http://image-fingerprint:8080/ from the Nuxeo container.
+    </installationDirective>
+  </command>
+
+  <command name="fingerprint-decode" enabled="true">
+    <commandLine>curl</commandLine>
+    <parameterString>-sS --fail-with-body --max-time 80 -H "Expect:" -o #{outDirPath}/nxblob-fingerprinted.json --data-binary @#{sourceFilePath} "http://image-fingerprint:8080/decode"</parameterString>
+    <timeout>90s</timeout>
+    <installationDirective>
+      Start the "image-fingerprint" service and make sure it is reachable at http://image-fingerprint:8080/ from the Nuxeo container.
+    </installationDirective>
+  </command>
+</extension>
+
+<extension target="org.nuxeo.ecm.core.convert.service.ConversionServiceImpl" point="converter">
+
+  <converter name="fingerprint-embed-jpeg" class="org.nuxeo.ecm.platform.convert.plugins.CommandLineConverter">
+    <sourceMimeType>image/jpeg</sourceMimeType>
+    <sourceMimeType>image/png</sourceMimeType>
+    <sourceMimeType>image/webp</sourceMimeType>
+    <sourceMimeType>image/tiff</sourceMimeType>
+    <destinationMimeType>image/jpeg</destinationMimeType>
+    <parameters>
+      <parameter name="CommandLineName">fingerprint-embed-jpeg</parameter>
+    </parameters>
+  </converter>
+
+  <converter name="fingerprint-decode" class="org.nuxeo.ecm.platform.convert.plugins.CommandLineConverter">
+    <sourceMimeType>image/jpeg</sourceMimeType>
+    <sourceMimeType>image/png</sourceMimeType>
+    <sourceMimeType>image/webp</sourceMimeType>
+    <sourceMimeType>image/tiff</sourceMimeType>
+    <destinationMimeType>application/json</destinationMimeType>
+    <parameters>
+      <parameter name="CommandLineName">fingerprint-decode</parameter>
+    </parameters>
+  </converter>
+</extension>
