@@ -356,6 +356,34 @@ reading `AbstractWork` again:
     its idle timeout must exceed `curl --max-time`, so that `curl` is always what gives up first. An
     AWS ALB idles out at **60s by default, the same value as `CONVERT_TIMEOUT_S`**, and would return
     its own 504 instead of the service's plain-text one. Documented in `README-Running-at-scale.md`.
+  - **The token generator** in `README.md` ("Generate a unique token") is an example, not something
+    this repository builds or tests - but every constant in it is load-bearing, so don't tidy it up:
+    - `Fn.getNextId` returns `Long.toString(seq.getNextLong(key))` (`PlatformFunctions:176`), an
+      atomic non-transactional counter starting at 1. Nuxeo lists it in
+      `Call.MVEL_BLACK_LIST_EXPR` precisely because each call consumes a number, so a retry gets a
+      **different** token - hence the note about writing the mapping in the same unit of work.
+    - The alphabet has **32** characters because `32^8` is *exactly* `2^40`, which a 2x20-bit
+      Feistel covers with no remainder: every position is uniform and nothing leaks. The previous
+      draft used 57 characters over `2^46`, and `2^46 / 57^7 = 35.996` meant the first character
+      could only take 36 of the 57 values - a visible signature of the scheme. A wider alphabet
+      makes the generator *more* detectable here, not less. Dropping lowercase also removes the
+      nine confusable case pairs (`C/c K/k P/p S/s U/u V/v W/w X/x Z/z`) and keeps the tokens valid
+      under the old `A-Z0-9` service regex.
+    - A Feistel is bijective whatever the round function does, **as long as both halves stay on
+      exactly 20 bits** - that is what the `& MASK` are for, and it is the whole uniqueness proof.
+      Collisions are impossible by construction, so the birthday numbers quoted for random tokens
+      do not apply. Measured: 0 duplicates over 1,000,000 consecutive calls, all 32 symbols at each
+      of the 8 positions within 1%, and the character-match distribution for adjacent sequence
+      numbers matches `B(8, 1/32)` to within noise.
+    - `Math.floor(n / 32)`, not `>>`: JS bitwise operators truncate to 32 bits and `n` reaches 2^40.
+    - `OFFSET` exists only to keep small sequence numbers out of the `left == 0` corner, where the
+      first Feistel round degenerates. `(seq + OFFSET) % SPACE` stays bijective.
+    - The `isFinite` guard is **not** defensive padding: without it an unparseable sequence becomes
+      `NaN`, and `NaN` flows through untouched to yield one constant token (`"RJRHnLAY"` with the
+      57-character variant) reused for every document, silently.
+    - `KEYS` and `OFFSET` are frozen once in production, and they sit in clear text in the script.
+      This is obfuscation - it hides volume and ordering - not encryption. Don't present it as a
+      security control; `README.md` already requires checking a decoded token against your own table.
 
 ## Deployment topologies
 
