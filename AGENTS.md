@@ -102,14 +102,19 @@ not work. `samples/` and `README.md` stay at the root and are not part of the im
     context (`uvicorn/_subprocess.py`), so each worker re-imports `app.py` and builds its **own** copy
     of the model - no copy-on-write sharing. Worse, `MAX_CONCURRENT` is a *per-process* semaphore, so
     N workers allow N simultaneous conversions inside a single `mem_limit`, silently defeating the
-    memory guard. The OOM killer then acts on the whole cgroup, taking the healthy requests with it.
+    memory guard. The OOM killer then fires on the whole cgroup and the kernel picks the victim -
+    usually the worker that overran, but possibly another one or the master, which takes the
+    container down. Don't claim all in-flight requests die; that is the worst case, not the rule.
   - **More CPU barely helps.** The model always runs on a fixed 256x256 tensor, so it is the
     full-resolution NumPy mixing that dominates large images, and that is largely single-threaded.
     Measured: 8 cores give only 1.9x on a 24 MP image (but 3.6x on a 1 MP one, where the model
     dominates), and a 24 MP embed only manages to use ~1.6 cores. `cpus: 2` with `TORCH_THREADS=2` is
     the sweet spot; setting `TORCH_THREADS` above the CPU quota is slightly counter-productive.
-- **Memory budget**: `450 MB + MAX_CONCURRENT x 90 bytes x MAX_PIXELS`. `MAX_CONCURRENT` and
-  `MAX_PIXELS` multiply, so they can only be raised against each other within one `mem_limit`.
+- **Memory budget**: `450 MB + MAX_CONCURRENT x 90 bytes x MAX_PIXELS`, and it is an **upper bound,
+  not a prediction** - it gives 3.15 GB at 30 MP where the measurement is ~2.7 GB. Keep it that way
+  (erring high is the safe direction) and don't "fix" the discrepancy by editing the measured table.
+  `MAX_CONCURRENT` and `MAX_PIXELS` multiply, so they can only be raised against each other within
+  one `mem_limit`.
 - **Timeout accounting**: `CONVERT_TIMEOUT_S` is armed *after* the request acquires the semaphore
   (`run()` in `app.py`), not when it arrives. A request queued behind others can therefore take
   longer than `CONVERT_TIMEOUT_S` wall-clock, which is why the client timeout has to be the larger
@@ -271,16 +276,26 @@ reading `AbstractWork` again:
 - **`ListenerWork` retries have no backoff.** Measured: 3 attempts (1 + 2 retries) spread over
   **48 ms**. They cannot ride out a restart of the fingerprint service. Raising `retryCount` adds
   attempts, not delay, so it does not help.
+- **`retryCount` is not an attribute of the automation `<handler>`.** `EventHandler` declares
+  `@id`, `@chainId`, `@postCommit`, `@enabled` and the `filters/*` nodes - nothing else, so XMap
+  drops `retryCount` silently. It belongs to the `<listener name="opchainpclistener">` descriptor,
+  which is the single listener behind *every* postCommit automation handler in the instance: a retry
+  there re-runs all matching handlers, not just the failing chain.
 - **`Bulk.RunAction` with the stock `automation` action does not retry either**: `failOnError`
   defaults to `false`, so the error is recorded and swallowed and the `maxRetries` policy never
   fires. Measured: `COMPLETED processed=1 errorCount=1`, service never contacted.
 - **BAF with `<option name="failOnError">true</option>` does work.** Measured: submitted with the
   service down, service started 2 s later, command recovered and completed with `errorCount=0` after
-  ~7 s of backoff. This is the only configuration that survived an outage.
-- **Nothing survives a Nuxeo restart without Kafka**, and it fails *silently*: measured, an in-flight
-  bulk command was still reporting `state=RUNNING processed=0` sixty seconds after the restart, with
-  the service healthy and never contacted. `nuxeo.stream.work.enabled` defaults to
-  `${kafka.enabled}` = false.
+  ~7 s of backoff. This is the only configuration that survived an outage. Keep the stock
+  `defaultConcurrency`/`defaultPartitions` `${...:=N}` forms when redeclaring the processor, or the
+  `nuxeo.bulk.action.automation.*` properties stop working. `failOnError=true` rolls the transaction
+  back and rethrows, so the retry is of the **whole batch**, not of the failing document.
+- **Kafka is mandatory in production**, so resilience is not a question there. The "nothing survives
+  a Nuxeo restart" finding is a **development-stack** artefact: with `kafka.enabled=false` the
+  streams are in-memory, and measured, an in-flight bulk command was still reporting
+  `state=RUNNING processed=0` sixty seconds after the restart. Frame it that way; don't attribute it
+  to `nuxeo.stream.work.enabled`, which only swaps the WorkManager implementation and is a
+  FreeMarker template variable read nowhere in Java - BAF uses streams either way.
 - **`ConversionService.scheduleConversion` is a trap**: `ConversionWork` has 0 retries and
   `ConversionStatus` has no FAILED state, so a failure is indistinguishable from "still running".
 - **Contributions in `nxserver/config/` must be named `*-config.xml` or `*-bundle.xml`**
@@ -323,9 +338,11 @@ reading `AbstractWork` again:
     (`nuxeo.db.transactiontimeout`, 300s by default). `<timeout>` is parsed as a `Duration`, so its
     unit is mandatory (`90s`, not `90`), and Nuxeo enforces
     `min(<timeout>, remaining transaction TTL)` by prefixing the command with `timeout -s 9`.
-    When a load balancer sits in front of the service it adds a link to that chain: an AWS ALB idles
-    out at **60s by default, the same value as `CONVERT_TIMEOUT_S`**, and would return its own 504
-    instead of the service's plain-text one. Documented in `README-Running-at-scale.md`.
+    When a load balancer sits in front of the service, it is **not** a step in that chain - Nuxeo's
+    `<timeout>` kills `curl` and says nothing about the hop in between. It is a separate constraint:
+    its idle timeout must exceed `curl --max-time`, so that `curl` is always what gives up first. An
+    AWS ALB idles out at **60s by default, the same value as `CONVERT_TIMEOUT_S`**, and would return
+    its own 504 instead of the service's plain-text one. Documented in `README-Running-at-scale.md`.
 
 ## Deployment topologies
 
@@ -346,12 +363,17 @@ Two are supported, and the documentation splits along that line:
 - The service is stateless (no DB, no shared volume, weights baked into the image), so sharing it
   across nodes needs no coordination. The argument for sharing is the **reserved headroom**: a
   sidecar per node reserves peak memory on every node for work that runs rarely.
+- **Scaled replicas get `tmpfs: /tmp`, not the named volume of `README.md`.** A named volume is
+  mounted into *every* replica, so `scale: N` would hand them a shared scratch and cache directory
+  (`HOME=/tmp`) and silently contradict the statelessness claim above. One replica, named volume;
+  several replicas, tmpfs.
 - **Compose scaling facts**, verified against the specification: `scale: N` is a plain service
   attribute and the simplest form (`deploy.replicas` and `--scale` are equivalents). A
   `container_name` makes Compose **refuse** to scale - that is a hard error. A `hostname` does not;
   it is merely pointless, since every replica would share it. Don't conflate the two, as an earlier
   version of the docs did.
 - **Getting the image to a standalone host**: build on the target, or build once and push to a
-  private registry. Permitted - every component is permissively licensed, so there is no
-  source-offer obligation - but nothing in this repository is set up to publish, and that stays out
-  of scope.
+  private registry. Permitted - the Python and ML layer is entirely permissive, so no source-offer
+  obligation attaches to it; the `python:3.12-slim` base is still Debian, so a redistributor keeps
+  the ordinary Debian distributor obligations. Nothing in this repository is set up to publish, and
+  that stays out of scope.

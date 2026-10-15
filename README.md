@@ -391,8 +391,8 @@ The `image-fingerprint/` folder is the Docker build context and is self-containe
 **In short.** This service is **memory-bound, not CPU-bound**. Sizing it comes down to one question:
 how large an image must it accept?
 
-- **Memory per container** is roughly `450 MB + MAX_CONCURRENT x 90 bytes x MAX_PIXELS`. With the
-  defaults (1 concurrent, 30 MP) that is about 2.7 GB, which is why `mem_limit` is `4g`.
+- **Memory per container** is at most `450 MB + MAX_CONCURRENT x 90 bytes x MAX_PIXELS`. Measured peak
+  with the defaults (1 concurrent, 30 MP) is about 2.7 GB, which is why `mem_limit` is `4g`.
 - **Need more throughput?** Add **replicas** - not `--workers`, not threads. Each replica gets its own
   memory budget and its own failure domain.
 - **Short of RAM?** Lower `MAX_PIXELS` first; it is by far the cheapest lever. At 8 MP a replica fits in
@@ -518,8 +518,7 @@ The port is published on `127.0.0.1` only, for this test. In a real deployment, 
   measurements behind that.
 - **Asynchronous calls need care**: an async post-commit handler retries twice, but with **no
   backoff** - all attempts are spent within milliseconds, so they do not survive a restart of this
-  service. The Bulk Action Framework does, but only with `failOnError` enabled, and nothing survives a
-  Nuxeo restart unless Kafka is enabled. All tested, see
+  service. The Bulk Action Framework does, but only with `failOnError` enabled. All tested, see
   [Calling it asynchronously](README-Running-at-scale.md#calling-it-asynchronously).
 
 

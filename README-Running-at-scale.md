@@ -6,9 +6,10 @@ presales demo, a proof of concept, and most production installations that finger
 publication. Read this when the defaults stop fitting - large images, high volume, or a need for the
 fingerprinting to survive the service being briefly unavailable.
 
-- [Sizing the host](#sizing-the-host) - memory budget, host examples
-- [Memory](#memory), [CPU and threads](#cpu-and-threads) - what the limits are made of
-- [Scaling out](#scaling-out-replicas-not-workers-or-threads) - replicas, and why not workers
+- [Sizing and tuning](#sizing-and-tuning) - the section below, in four parts:
+  - [Sizing the host](#sizing-the-host) - memory budget, host examples
+  - [Memory](#memory), [CPU and threads](#cpu-and-threads) - what the limits are made of
+  - [Scaling out](#scaling-out-replicas-not-workers-or-threads) - replicas, and why not workers
 - [Deploying as a shared service](#deploying-as-a-shared-service) - off-box, shared by several Nuxeo nodes
 - [Calling it asynchronously](#calling-it-asynchronously) - queues, retries, and what actually works
 
@@ -35,10 +36,14 @@ below are a measured idle floor plus an explicitly flagged projection.*
 Start from the memory budget, because that is what fails hard:
 
 ```
-per container  ~=  450 MB  +  MAX_CONCURRENT x 90 bytes x MAX_PIXELS
+per container  <=  450 MB  +  MAX_CONCURRENT x 90 bytes x MAX_PIXELS
 ```
 
-| `MAX_PIXELS` | Typical source | Peak per container | Suggested `mem_limit` |
+Size with that, but read it as an **upper bound rather than a prediction**: measured peaks sit a
+little under it at the top of the range (it gives 3.15 GB for 30 MP, where the measurement is about
+2.7 GB). Erring high is the right direction here - the failure mode is an OOM kill, not a slowdown.
+
+| `MAX_PIXELS` | Typical source | Measured peak per container | Suggested `mem_limit` |
 |---|---|---|---|
 | 30 MP (default) | 60 Mpx-class camera, large scans | ~2.7 GB | `4g` |
 | 12 MP | Most phone photos | ~1.5 GB | `2g` |
@@ -58,17 +63,24 @@ That is a **floor, measured at rest**. Under real load Nuxeo's heap and OpenSear
 past it; a working estimate of 6-8 GB for the Nuxeo side is more realistic, but that figure is a
 projection, not something measured here.
 
-Putting the two together, for a host shared with Nuxeo:
+Putting the two together, for a host shared with Nuxeo. `cpus` is a quota, not a reservation, and a
+large embed only manages to use ~1.6 cores, so a little CPU oversubscription is fine - but it is what
+decides whether a bulk run crawls:
 
 | Host | Nuxeo side (estimated, under load) | Left over | Realistic fingerprinting capacity |
 |---|---|---|---|
 | 4 vCPU / 16 GB (e.g. `t3.xlarge`) | ~7 GB, 2-3 vCPU | ~8 GB, 1-2 vCPU | **1 replica** at `mem_limit: 4g`, `cpus: 2`. Fine for occasional fingerprinting; CPU-contended for bulk runs |
 | 8 vCPU / 32 GB (e.g. `m5.2xlarge`) | ~7 GB, 2-3 vCPU | ~24 GB, 5 vCPU | **2-3 replicas** comfortably |
-| 4 vCPU / 16 GB, `MAX_PIXELS=8000000` | ~7 GB | ~8 GB | **2-3 replicas** at `mem_limit: 2g` - the same box, by accepting smaller images |
+| 4 vCPU / 16 GB, `MAX_PIXELS=8000000` | ~7 GB, 2-3 vCPU | ~8 GB, 1-2 vCPU | **2-3 replicas** at `mem_limit: 2g` fit in the *memory* - the same box, by accepting smaller images. The CPU does not grow with them, so they absorb bursts rather than run faster |
 
 The last row is the point worth taking away: **lowering `MAX_PIXELS` buys more capacity than buying a
 bigger instance**, as long as your images really are that size. A 30 MP ceiling on a library of 12 MP
 photos reserves memory that is never used.
+
+> [!NOTE]
+> `t3` is a burstable instance family. A one-off bulk run over thousands of images will drain its CPU
+> credits and then be throttled to the baseline. For sustained work, prefer a fixed-performance
+> family (`m5`, `c5`, ...).
 
 ### Memory
 
@@ -84,10 +96,10 @@ Peak container memory, embedding one image at a time:
 | 24 MP | ~2.5 GB |
 | 30 MP (the `MAX_PIXELS` default) | ~2.7 GB |
 
-Rule of thumb: **~450 MB plus about 90 bytes per pixel**. TrustMark upsamples the watermark residual to
-full resolution as `float32`, then mixes it with the cover image as `float64`, so the cost is driven by
-the pixel count, not by the file size. A 3 MB JPEG and a 3 MB PNG of very different dimensions cost
-very different amounts of memory.
+Rule of thumb for sizing: **450 MB plus up to about 90 bytes per pixel**. TrustMark upsamples the
+watermark residual to full resolution as `float32`, then mixes it with the cover image as `float64`, so
+the cost is driven by the pixel count, not by the file size. A 3 MB JPEG and a 3 MB PNG of very
+different dimensions cost very different amounts of memory.
 
 This is why `mem_limit` is `4g`. With `2g`, a 30 MP image gets the container **OOM-killed**: the client
 sees a dropped connection, not a clean error, and every other request in that container dies with it.
@@ -156,16 +168,18 @@ Worse, `MAX_CONCURRENT` is a **per-process** semaphore. Four workers each holdin
 means four conversions at once, so the limit you set to protect memory quietly stops doing so:
 
 ```
-4 workers x 30 MP x ~90 bytes/pixel  ~=  9 GB   inside a 4 GB container
+4 workers x 30 MP x ~90 bytes/pixel  ~=  10.8 GB   inside a 4 GB container
 ```
 
-And the blast radius is wrong: the OOM killer acts on the **cgroup**, which is the whole container, so
-the three healthy requests on the other workers die alongside the one that overran.
+And you no longer control what dies: the OOM killer fires on the **cgroup**, which is the whole
+container, and the kernel picks the victim. Usually that is the worker that overran, and uvicorn
+restarts it - but it can be another worker, or the master, in which case the container goes down and
+every request in it with it.
 
 **Why replicas.** Each container is its own cgroup with its own `mem_limit`, so the budget is *per
 replica*. `MAX_CONCURRENT=1` keeps meaning what you sized it to mean: one image in flight, one memory
 ceiling. An OOM kills one replica, the others keep serving, and `restart: unless-stopped` brings it
-back - one failed request instead of four.
+back - one failed request, and a failure domain you can actually reason about.
 
 ```yml
   image-fingerprint:
@@ -186,8 +200,11 @@ back - one failed request instead of four.
       - ALL
     security_opt:
       - no-new-privileges:true
-    volumes:
-      - image-fingerprint-tmp:/tmp
+    # tmpfs, not the named volume of README.md: replicas must not share one /tmp.
+    # A named volume is mounted into *every* replica, which would hand them a common
+    # scratch and cache directory (HOME is /tmp) and quietly make the service stateful.
+    tmpfs:
+      - /tmp
     scale: 3
 ```
 
@@ -207,10 +224,10 @@ with two replicas: consecutive calls to `http://image-fingerprint:8080/health` a
 `172.20.0.2` and `172.20.0.3`.
 
 Two caveats. The shuffle is **not load-aware** - there is no least-connections logic, so a request can
-land on a busy replica while another sits idle. The Compose specification is explicit that
-*"exactly which container the name resolves to is not guaranteed"*. And this works *because* `curl` is
-short-lived; a client
-with a persistent connection pool would pin itself to one replica and need a real balancer.
+land on a busy replica while another sits idle. And it is a convenience, not a contract: the Compose
+specification says of a name shared by several containers that *"exactly which container the name
+resolves to is not guaranteed"*. This also works *because* `curl` is short-lived; a client with a
+persistent connection pool would pin itself to one replica and need a real balancer.
 
 **What a replica buys.** Six concurrent 1 MP requests, `MAX_CONCURRENT=1`, `cpus: 2` each:
 
@@ -240,17 +257,22 @@ Everything above assumes the sidecar layout of `README.md`: the service runs in 
 project as Nuxeo. That is the right shape for a demo, a proof of concept and a single-node install.
 
 For a **cluster of several Nuxeo nodes** it is usually the wrong shape, and the reason is not the idle
-cost - 450 MB per node is noise on a Nuxeo box. It is the **headroom you have to reserve**:
+cost - 450 MB per node is noise on a Nuxeo box. It is the **headroom you have to plan for**, counted
+here at the measured 30 MP peak of ~2.7 GB per instance:
 
-| Layout, 4 Nuxeo nodes | RAM reserved for fingerprinting | Actually used |
+| Layout, 4 Nuxeo nodes | RAM to plan for | Actually used |
 |---|---|---|
-| A sidecar on every node | 4 x 2.7 GB = **~11 GB** | rarely, and never on more than one node at a time |
-| Shared, 2 instances (HA) | **5.4 GB** | the same work |
+| A sidecar on every node | 4 x 2.7 GB = **~11 GB**, spread one lump per node | rarely, and a burst on one node cannot borrow another node's lump |
+| Shared, 2 instances (HA) | **5.4 GB**, pooled | the same work |
 | Shared, 1 instance | **2.7 GB** | the same work |
 
-With sidecars you reserve peak capacity on *every* node for something that runs occasionally, and an
+With sidecars you budget peak capacity on *every* node for something that runs occasionally, and an
 idle container on node 1 cannot absorb a burst on node 2. Deployed on its own, the capacity is pooled.
 This is the same reasoning that puts MongoDB and OpenSearch on their own hosts.
+
+The counterweight: a sidecar costs no extra host, while a shared service needs somewhere to run. If
+the Nuxeo nodes have the memory to spare anyway, sidecars are cheaper and simpler - the comparison
+above only becomes an argument when that headroom is what forces you to a bigger instance type.
 
 It also makes a temporary scale-up practical: for a one-off campaign over thousands of images, scale
 the shared service up and back down again. Doing that to a sidecar on every Nuxeo node is far more
@@ -338,24 +360,29 @@ service answering, no data flows, which an ALB counts as idle. It can therefore 
 before the service's plain-text 504 arrives - destroying exactly the error reporting the timeout chain
 exists to preserve.
 
-Make the load balancer timeout longer than anything the client will wait for:
+The chain itself is unchanged, and the load balancer is not a step in it - Nuxeo's `<timeout>` kills
+`curl`, it says nothing about the hop in between:
 
 ```
-CONVERT_TIMEOUT_S (60)  <  curl --max-time (80)  <=  LB idle timeout (120)  <  <timeout> (90s)*
+CONVERT_TIMEOUT_S (60)  <  curl --max-time (80)  <  <timeout> (90s)  <  transaction timeout (300s)
 ```
 
-\* with the caveat that `<timeout>` must still be under the transaction timeout. The simplest rule:
-set the load balancer well clear of the chain, for example 120 s, so it never fires first. A network
-load balancer avoids the problem differently, as it does not apply an HTTP idle timeout.
+The load balancer is a **separate constraint on that hop**: its idle timeout must be longer than
+`curl --max-time`, so that `curl` is always the one that decides to give up and the service's own
+error is what comes back. With the values above, anything from 120 s up works. A network load
+balancer sidesteps the HTTP idle timeout, but still applies a TCP one - 350 s by default on AWS,
+comfortably clear of the chain.
 
 ### Getting the image onto the host
 
 The repository ships source; each user builds their own image. For a standalone deployment either
 build on the target host, or build once and push to a private registry such as ECR.
 
-Pushing to a private registry is **unencumbered here**: every component in the image is permissively
-licensed (MIT / BSD / Apache-2.0 / PSF), so there is no copyleft source-offer obligation. See
-`image-fingerprint/THIRD-PARTY-NOTICES.md`.
+Pushing to a private registry is **unencumbered here**: the whole Python and ML layer is permissively
+licensed (MIT / BSD / Apache-2.0 / PSF), with no copyleft component and so no source-offer obligation
+attached to any of it. The one thing you do carry is the ordinary Debian one - the `python:3.12-slim`
+base ships GPL system tools like every Debian-derived image, so a redistributor keeps the usual
+distributor obligations. See `image-fingerprint/THIRD-PARTY-NOTICES.md`.
 
 Health checks move from Docker's `HEALTHCHECK` to whatever the platform uses. `GET /health` is already
 suitable for a load balancer health check: it returns 200 with
@@ -372,7 +399,7 @@ ready to work.
 | Situation | Layout |
 |---|---|
 | Demo, proof of concept, single Nuxeo node | **Sidecar**, exactly as `README.md` describes. No extra operational surface |
-| Cluster of 3-4 nodes, occasional fingerprinting | **Shared, 2 instances** behind an internal load balancer. Reserves 5.4 GB once instead of ~11 GB spread thin, and survives losing one |
+| Cluster of 3-4 nodes, occasional fingerprinting | **Shared, 2 instances** behind an internal load balancer. Budgets 5.4 GB once instead of ~11 GB spread thin, and survives losing one |
 | Cluster, shared, single instance | Works, and is cheap, but it is a cluster-wide single point of failure. How badly that bites depends on *how* you call it - see the note below |
 | One-off campaign over thousands of images | Shared, scaled up temporarily, then back down. Pair it with the Bulk Action Framework, see [Calling it asynchronously](#calling-it-asynchronously) |
 
@@ -382,13 +409,13 @@ invocation style decides whether you ever find out.
 | How you call it | A fingerprinting outage looks like |
 |---|---|
 | Synchronously (`Blob.RunConverter`, the default) | The operation fails immediately, with the service's plain-text error. Loud, and in front of whoever triggered it |
-| Async post-commit handler | **Silent.** The user's action succeeded, the three retries are spent in 48 ms, and nothing reaches the caller |
+| Async post-commit handler | **Silent.** The user's action succeeded, the three attempts are spent in 48 ms, and nothing reaches the caller |
 | Bulk Action Framework | Visible as `errorCount` in the command status, and with `failOnError=true` it retries with backoff and usually recovers |
 
-The one combination to avoid is **a single shared instance, called from an async post-commit handler,
-without Kafka**: the whole cluster depends on one container, nothing retries usefully, and nobody is
-told. Running two instances, using the Bulk Action Framework, or keeping the call synchronous - any
-one of the three removes the trap.
+The one combination to avoid is **a single shared instance called from an async post-commit
+handler**: the whole cluster depends on one container, the retries are spent in milliseconds, and
+nobody is told. Running two instances, using the Bulk Action Framework, or keeping the call
+synchronous - any one of the three removes the trap.
 
 
 ## Calling it asynchronously
@@ -412,14 +439,9 @@ LTS 2025 instance**, not just read in the sources.
 Fingerprinting is normally applied only to the renditions you publish or send, so the volumes are
 small. Reliability, not throughput, is what you are buying here.
 
-### What `MAX_CONCURRENT=1` means for the caller
-
-Six concurrent requests against one replica complete in a clean staircase, one step of about 0.2 s
-per request, because they queue rather than compete for memory. A single request takes 0.23 s, so the
-sixth one waits about a second before it even starts.
-
-That wait does **not** count against `CONVERT_TIMEOUT_S`, which only starts once a request gets a
-slot - but it does count against `curl --max-time`. See
+Whichever option you pick, remember that `MAX_CONCURRENT=1` makes concurrent callers queue, that the
+queue wait does **not** count against `CONVERT_TIMEOUT_S` but does count against `curl --max-time`,
+and that the answer to a persistent queue is replicas rather than longer timeouts. The numbers are in
 [Scaling out](#scaling-out-replicas-not-workers-or-threads).
 
 ### Option A: an asynchronous post-commit automation handler
@@ -454,12 +476,27 @@ exactly **three times** - the initial run plus the two retries of `ListenerWork`
 
 There is **no backoff between retries**. A container restart takes seconds, so by the time the
 service is back, all three attempts have been spent. These retries protect against an instantaneous
-blip and nothing else. `retryCount="5"` on the listener raises the count but not the delay, so it
-does not change the conclusion.
+blip and nothing else.
 
 > [!WARNING]
 > Do not rely on `ListenerWork` retries to ride out a restart of the fingerprinting service. They
 > are exhausted in milliseconds.
+
+Raising the count does not help, and it is not raised where you would expect. `retryCount` is **not
+an attribute of `<handler>`** - `EventHandler` does not declare it, so XMap drops it silently and you
+get no warning. It belongs to the *listener*, and every automation post-commit handler in the
+instance shares one, `opchainpclistener`:
+
+```xml
+<extension target="org.nuxeo.ecm.core.event.EventServiceComponent" point="listener">
+  <!-- Instance-wide: this is THE listener behind every postCommit automation handler -->
+  <listener name="opchainpclistener" retryCount="5"/>
+</extension>
+```
+
+Two reasons not to bother: the extra attempts still have no delay between them, and because that one
+listener dispatches to every matching handler, a retry re-runs **all** of them on the same event, not
+just the chain that failed.
 
 ### Option B: the Bulk Action Framework, with `failOnError` turned on
 
@@ -472,25 +509,41 @@ asynchronously, with a real retry policy. **But the stock contribution does not 
 immediately as `COMPLETED processed=1 errorCount=1`, and the service was never contacted.
 
 `failOnError` is a **stream processor option**, not a parameter of the `Bulk.RunAction` call, so it
-has to be contributed:
+has to be contributed. Redeclare the stock processor and add the option, keeping everything else as
+the platform has it - in particular the two `${...:=N}` defaults, which are what makes concurrency
+and partitions tunable from `nuxeo.conf`:
 
 ```xml
-<require>org.nuxeo.ecm.core.automation.features.bulk</require>
+<component name="com.example.fingerprint.bulk">
 
-<extension target="org.nuxeo.runtime.stream.service" point="streamProcessor">
-  <streamProcessor name="automation"
-    class="org.nuxeo.ecm.automation.core.operations.services.bulk.AutomationBulkAction"
-    defaultConcurrency="2" defaultPartitions="4">
-    <policy name="default" maxRetries="3" delay="1s" maxDelay="5s" continueOnFailure="true" />
-    <option name="failOnError">true</option>
-  </streamProcessor>
-</extension>
+  <require>org.nuxeo.ecm.core.automation.features.bulk</require>
+
+  <extension target="org.nuxeo.runtime.stream.service" point="streamProcessor">
+    <streamProcessor name="automation"
+      class="org.nuxeo.ecm.automation.core.operations.services.bulk.AutomationBulkAction"
+      defaultConcurrency="${nuxeo.bulk.action.automation.defaultConcurrency:=2}"
+      defaultPartitions="${nuxeo.bulk.action.automation.defaultPartitions:=4}">
+      <policy name="default" maxRetries="3" delay="1s" continueOnFailure="true" />
+      <option name="failOnError">true</option>
+    </streamProcessor>
+  </extension>
+
+</component>
 ```
+
+The `<policy>` is the stock one, copied as is: `delay="1s"` with the default `maxDelay` of 10s gives
+an exponential backoff of roughly 1s, 2s, 4s over the three retries.
 
 > [!NOTE]
 > This overrides the platform's shared `automation` processor, so it changes the behaviour of
 > **every** `Bulk.RunAction` using that action, not just fingerprinting. If that is too broad,
 > contribute your own action and processor instead.
+
+> [!IMPORTANT]
+> `failOnError=true` makes the failure roll the **transaction** back and rethrow, so the retry is of
+> the whole batch, not of the one document that failed. Documents already processed in that batch are
+> processed again - which is fine here only because an embed is idempotent (see below). Check that
+> before turning this on for a chain that does something else.
 
 **Confirmed by testing:** with that contribution, the command was submitted while the service was
 down, the service was started 2 seconds later, and the command **recovered**:
@@ -516,32 +569,36 @@ POST /nuxeo/site/automation/Bulk.RunAction
 
 and poll `GET /nuxeo/api/v1/bulk/{commandId}` for `state`, `processed` and `errorCount`.
 
-### The caveat that outranks all of the above
+### Don't draw conclusions from a development stack
 
-> [!WARNING]
-> **Without Kafka, in-flight work does not survive a Nuxeo restart - and it fails silently.**
+Whether in-flight work survives a Nuxeo restart is a property of the stream backend, not of this
+service. **A production Nuxeo runs on Kafka** - it is the supported queueing backend and the platform
+documentation requires it. With Kafka there is nothing to think about here: a bulk command caught by
+a restart resumes.
 
-`nuxeo.stream.work.enabled` defaults to `${kafka.enabled}`, which is `false`. Nuxeo then logs, at
-every startup:
+A development stack usually has `kafka.enabled=false` and falls back to in-memory streams, which
+Nuxeo says plainly at every startup:
 
 ```
 In-Memory type for log config "default" is ONLY for testing purpose. Use Kafka for production.
 ```
 
-**Confirmed by testing:** a bulk command was submitted, Nuxeo was restarted while it was in flight,
-and the fingerprinting service was brought back up. Sixty seconds later the command was still
-reported as:
+**Confirmed by testing**, and worth knowing because of *how* it fails: a bulk command was submitted,
+Nuxeo was restarted while it was in flight, and the fingerprinting service was brought back up. Sixty
+seconds later the command was still reported as:
 
 ```
 state=RUNNING  processed=0  errorCount=0
 ```
 
-It never resumed, and the service never received a request. The status stays `RUNNING` **forever** -
-so the failure is not even visible as a failure. Anything polling that command waits indefinitely.
+It never resumed, and the service never received a request. The queued work died with the JVM, but
+the command's *status* is stored separately and durably, and only terminal states expire - so it
+stays `RUNNING` forever. The failure is not even visible as a failure, and anything polling that
+command waits indefinitely.
 
-If you need fingerprinting to survive a Nuxeo restart, enable Kafka (`kafka.enabled=true`). Otherwise
-keep a way to detect and re-submit: a flag on the document, and a periodic query for documents that
-should have been fingerprinted and were not.
+So: test the retry behaviour of [Option B](#option-b-the-bulk-action-framework-with-failonerror-turned-on)
+on a dev stack by all means, but don't conclude anything about resilience from it, and don't ship
+without Kafka.
 
 ### Idempotency, and why retries are safe here
 
@@ -564,11 +621,10 @@ exactly once", keep a flag on the document.
 Verified by reading the LTS 2025 sources, but not exercised:
 
 - The dead letter queue, and replaying it with the `WorkManager.RunWorkInFailure` operation. A failed
-  work should be appended to the `work/dlq` stream; with the in-memory implementation that stream is
-  itself lost on restart.
-- `retryCount="N"` on a listener. The attribute exists (`EventListenerDescriptor`), but since it
-  changes only the number of immediate attempts and not the delay, it does not change the conclusion
-  above.
+  work should be appended to the `work/dlq` stream.
+- `retryCount="5"` on `opchainpclistener`. The attribute and its effect are established from the
+  sources (`EventListenerDescriptor`, `AsyncEventExecutor.ListenerWork`), but the contribution above
+  was not run - and since it adds attempts without adding delay, it would not change the conclusion.
 - Saving the fingerprinted blob back onto the document. The test chain deliberately only ran the
   converter and logged the result, which avoids the re-entrancy question entirely. **If you do save
   the result, your own save will re-fire `documentModified` and re-trigger the handler** - use a
