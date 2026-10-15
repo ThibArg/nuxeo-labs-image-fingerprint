@@ -60,7 +60,7 @@ not work. `samples/` and `README.md` stay at the root and are not part of the im
   GPL/LGPL dependency would invalidate that claim. Update `THIRD-PARTY-NOTICES.md` whenever what the
   image contains changes.
 - **Stable API**: Nuxeo integrations depend on
-  `POST /embed?payload=<1-8 A-Z0-9>[&format=jpeg|png|webp][&strength=0.5-2.0]`, `POST /decode`,
+  `POST /embed?payload=<1-8 A-Za-z0-9>[&format=jpeg|png|webp][&strength=0.5-2.0]`, `POST /decode`,
   the raw request body, the content types, the status codes (400, 413, 500, 504) and plain-text
   error bodies (so `curl --fail-with-body` fails). `/decode` returns **200** with
   `{"present":false,"payload":null}` when there is no watermark - that is not an error and callers
@@ -75,10 +75,21 @@ not work. `samples/` and `README.md` stay at the root and are not part of the im
 
 ## Why things are the way they are
 
-- **8 characters, `A-Z0-9`**: TrustMark carries 100 bits. The default `BCH_5` schema spends 35 bits
-  on ECC and 4 on the schema version, leaving 61. Text mode packs 7 bits per character
-  (`DataLayer.encode_text_ascii`), so 8 chars = 56 bits fit and 9 = 63 bits do not. The charset is
-  restricted so the value is safe in a URL and on a command line with no escaping.
+- **8 characters, `A-Za-z0-9`**: TrustMark carries 100 bits. The default `BCH_5` schema spends 35 bits
+  on ECC and 4 on the schema version, leaving 61 (`DataLayer.schemaCapacity(1)`). Text mode packs
+  7 bits per character (`ord(t) & 127` in `DataLayer.encode_text_ascii`), so 8 chars = 56 bits fit and
+  9 = 63 bits do not. The 8-character limit is a **hard** one and the 400 matters: `process_encode`
+  does `packet_d = packet_d[0:data_bitcount]`, truncating silently, so a 9-character payload decodes
+  back with its last character wrong **and `present=True`**. Measured on the datalayer alone:
+  `TOOLONG12` -> `TOOLONG10`, `abcdefghi` -> `abcdefghh`.
+  The charset, on the other hand, is a **policy, not a TrustMark limit** - 7-bit ASCII means any
+  character below 128 round-trips, verified: `k7q2m9xa`, `Hello Wo` and `a-b_c.d!` all come back
+  intact. It is restricted to letters and digits so the value needs no URL encoding (`&`, `#`, `%`,
+  `+`, `?`) and survives `_decode_text`, which applies `.rstrip('\x00').strip()` and would eat a
+  leading or trailing space. Lowercase was excluded until 2026-10 for no technical reason; it is now
+  accepted, which takes the keyspace from 36^8 (2.8e12) to 62^8 (2.2e14) and makes the token
+  **case-sensitive**. Widening the charset is backwards compatible (`A-Z0-9` is a subset), narrowing
+  it again would not be.
 - **`loadRemover=False`** in both `app.py` and the `Dockerfile`: the default `True` downloads
   `trustmark_rm_Q.ckpt` (77 MB, larger than the encoder and decoder combined) for
   `remove_watermark()`, which this service does not expose. **Keep the two flags identical**: if
@@ -171,12 +182,13 @@ docker run --rm -d --name if-check -p 127.0.0.1:18090:8080 "$IMAGE"
 curl -s http://127.0.0.1:18090/health
 ```
 
-Round-trip on all three output formats (each must decode back to the payload sent):
+Round-trip on all three output formats. Use a **mixed-case** payload: it must come back with its case
+intact, which is what proves nothing lowercases the token on the way through.
 
 ```bash
 U=http://127.0.0.1:18090
 for f in jpeg png webp; do
-  curl -s -o /tmp/wm.$f --data-binary @samples/photo.jpg "$U/embed?payload=K7Q2M9XA&format=$f"
+  curl -s -o /tmp/wm.$f --data-binary @samples/photo.jpg "$U/embed?payload=k7Q2m9xA&format=$f"
   echo "$f -> $(curl -s --data-binary @/tmp/wm.$f $U/decode)"
 done
 # and the un-watermarked original must report present:false
@@ -190,10 +202,11 @@ t(){ printf "%-30s %s\n" "$1" "$(curl -s -o /dev/null -w '%{http_code}' "${@:2}"
 t "[400] empty"        -X POST --data-binary @/dev/null "$U/embed?payload=ABC"
 t "[400] no payload"   --data-binary @samples/photo.jpg "$U/embed"
 t "[400] 9 chars"      --data-binary @samples/photo.jpg "$U/embed?payload=TOOLONG12"
-t "[400] lowercase"    --data-binary @samples/photo.jpg "$U/embed?payload=abc"
+t "[400] bad char"     --data-binary @samples/photo.jpg "$U/embed?payload=ab-c"
 t "[400] bad format"   --data-binary @samples/photo.jpg "$U/embed?payload=ABC&format=gif"
 t "[400] bad strength" --data-binary @samples/photo.jpg "$U/embed?payload=ABC&strength=9"
 t "[400] not an image" --data-binary @image-fingerprint/Dockerfile "$U/embed?payload=ABC"
+t "[200] lowercase"    --data-binary @samples/photo.jpg "$U/embed?payload=abcdefgh"
 ```
 
 `MIN_SIDE` and `MAX_PIXELS` need generated images. Use a **compressible** one for the pixel limit: a

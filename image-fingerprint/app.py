@@ -38,9 +38,12 @@ MAX_PIXELS = int(os.environ.get("MAX_PIXELS", "30000000"))
 
 # TrustMark carries a 100-bit payload. The default BCH_5 schema spends 35 bits on error correction
 # and 4 on the schema version, leaving 61 bits of data. Text mode packs 7 bits per character, so
-# 8 characters (56 bits) fit and 9 (63 bits) do not.
-# Uppercase + digits only: safe in a URL and on a command line, no encoding needed.
-PAYLOAD_RE = re.compile(r"^[A-Z0-9]{1,8}$")
+# 8 characters (56 bits) fit and 9 (63 bits) do not. TrustMark does not reject a longer value, it
+# truncates it to 61 bits silently, so the 9th character comes back corrupted with present=True.
+# Letters and digits only: anything else would either need URL encoding (& # % + ?) or be lost at
+# decode time, where TrustMark applies .rstrip("\x00").strip() and drops leading/trailing spaces.
+# The payload is case-sensitive: BCH error correction restores the exact bits or nothing at all.
+PAYLOAD_RE = re.compile(r"^[A-Za-z0-9]{1,8}$")
 
 FORMATS = {"jpeg": ("JPEG", "image/jpeg"), "png": ("PNG", "image/png"), "webp": ("WEBP", "image/webp")}
 
@@ -151,7 +154,7 @@ async def embed(request: Request):
     status, received = 500, 0
     try:
         if not PAYLOAD_RE.match(payload):
-            raise ConversionError(400, "payload must be 1 to 8 characters, A-Z and 0-9 only")
+            raise ConversionError(400, "payload must be 1 to 8 characters, A-Z, a-z and 0-9 only")
         if fmt not in FORMATS:
             raise ConversionError(400, f"format must be one of: {', '.join(FORMATS)}")
         try:

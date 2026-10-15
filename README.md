@@ -12,7 +12,7 @@ nuxeo-labs-image-fingerprint
 * Provides a Docker container that adds/read (via a HTTP service) a fingerprint to/from an image, using
   [Trustmark](https://github.com/adobe/trustmark), MIT License.
 
-* The fingerprint is an **invisible watermark**: up to 8 characters (`A-Z`, `0-9`) encoded in the pixels
+* The fingerprint is an **invisible watermark**: up to 8 characters (`A-Z`, `a-z`, `0-9`) encoded in the pixels
   themselves. It survives re-compression, resizing and format conversion, and it is not metadata, so it
   does not disappear when a tool strips EXIF.
 
@@ -127,7 +127,7 @@ Both endpoints take the image as the **raw request body** (not multipart).
 
 | Endpoint | Parameters | Returns |
 |---|---|---|
-| `POST /embed` | `payload` (**required**): 1 to 8 characters, `A-Z` and `0-9` only.<br>`format`: `jpeg` (default), `png` or `webp`.<br>`strength`: 0.5 to 2.0, default 1.0. Higher = more robust but more visible. | The fingerprinted image, with the matching `Content-Type` |
+| `POST /embed` | `payload` (**required**): 1 to 8 characters, `A-Z`, `a-z` and `0-9` only, **case-sensitive**.<br>`format`: `jpeg` (default), `png` or `webp`.<br>`strength`: 0.5 to 2.0, default 1.0. Higher = more robust but more visible. | The fingerprinted image, with the matching `Content-Type` |
 | `POST /decode` | none | `application/json`: `{"present":true,"payload":"K7Q2M9XA"}` or `{"present":false,"payload":null}` |
 | `GET /health` | none | `{"status":"ok","trustmark":"0.9.2","model":"Q"}` (used by the Docker healthcheck) |
 
@@ -144,9 +144,19 @@ TrustMark carries a 100-bit payload. The default `BCH_5` schema spends 35 bits o
 on the schema version, leaving 61 bits. Text mode packs 7 bits per character, so 8 characters (56 bits)
 fit and 9 (63 bits) do not.
 
+The service rejects a longer payload with a 400 because TrustMark itself does not: it truncates to
+61 bits silently, so a 9-character token comes back with its last character corrupted and
+`"present":true`, which no caller could detect.
+
 This is enough because the payload is meant to be a **token**, not data: store the token in Nuxeo
 alongside the document id, the recipient, the date, and look it up when you decode. 8 characters of
-`A-Z0-9` is about 2.8 x 10^12 combinations.
+`A-Za-z0-9` is about 2.2 x 10^14 combinations.
+
+> [!WARNING]
+> The payload is **case-sensitive**: `K7q2m9xA` and `k7Q2M9Xa` are two different fingerprints, and
+> `/decode` returns the exact case that was embedded. Make sure the lookup table on the Nuxeo side is
+> case-sensitive too - an `ILIKE` query or a case-insensitive vocabulary would make the two collide.
+> Sticking to uppercase-only tokens sidesteps the question entirely.
 
 ### 4. `curl` examples (from the Nuxeo container)
 
@@ -171,7 +181,7 @@ Errors come back as plain text explaining the problem. Use `--fail-with-body` so
 
 | Status | When |
 |---|---|
-| 400 | Empty body; `payload` missing or not 1-8 `A-Z0-9` characters; unknown `format`; `strength` outside 0.5-2.0; not a supported image; shortest side below `MIN_SIDE` (150 px) |
+| 400 | Empty body; `payload` missing or not 1-8 `A-Za-z0-9` characters; unknown `format`; `strength` outside 0.5-2.0; not a supported image; shortest side below `MIN_SIDE` (150 px) |
 | 413 | Body larger than `MAX_UPLOAD_MB` (100), or image larger than `MAX_PIXELS` (30 MP). The pixel check runs on the header, before anything is decoded |
 | 500 | Unexpected failure; the message points at the container logs |
 | 504 | Processing took longer than `CONVERT_TIMEOUT_S`. The caller must allow more time than that, otherwise it gives up before this answer is sent |
@@ -207,7 +217,7 @@ The `image-fingerprint` HTTP service is not multipart, so everything must be pas
             point="command">
 
   <!-- Fingerprint an image, JPEG output
-       Requires the "payload" parameter: 1 to 8 chars, A-Z 0-9 -->
+       Requires the "payload" parameter: 1 to 8 chars, A-Z a-z 0-9 -->
   <command name="fingerprint-embed-jpeg" enabled="true">
     <commandLine>curl</commandLine>
     <parameterString>-sS --fail-with-body --max-time 80 -H "Expect:" -o #{outDirPath}/nxblob-fingerprinted.jpg --data-binary @#{sourceFilePath} "http://image-fingerprint:8080/embed?format=jpeg&amp;payload=#{payload}"</parameterString>
@@ -485,7 +495,7 @@ The port is published on `127.0.0.1` only, for this test. In a real deployment, 
 
 ## Good to know
 
-- **The payload is a token, not data.** 8 characters of `A-Z0-9`. Keep the mapping
+- **The payload is a token, not data.** 8 characters of `A-Za-z0-9`, case-sensitive. Keep the mapping
   token -> (document, recipient, date) in Nuxeo and look it up after decoding.
 - **A `true` result is not a proof.** The BCH error correction can occasionally "correct" random noise
   into a well-formed payload, so an image that was never fingerprinted can come back as
