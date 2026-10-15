@@ -9,6 +9,7 @@ fingerprinting to survive the service being briefly unavailable.
 - [Sizing the host](#sizing-the-host) - memory budget, host examples
 - [Memory](#memory), [CPU and threads](#cpu-and-threads) - what the limits are made of
 - [Scaling out](#scaling-out-replicas-not-workers-or-threads) - replicas, and why not workers
+- [Deploying as a shared service](#deploying-as-a-shared-service) - off-box, shared by several Nuxeo nodes
 - [Calling it asynchronously](#calling-it-asynchronously) - queues, retries, and what actually works
 
 > [!IMPORTANT]
@@ -171,9 +172,12 @@ back - one failed request instead of four.
     build:
       context: ./image-fingerprint
     image: image-fingerprint
-    # no "hostname:" and no "container_name:" when scaling - the service name is what resolves
+    # No "container_name:" - Compose refuses to scale a service that declares one.
+    # "hostname:" is allowed but pointless here: every replica would get the same
+    # host name, and it is the service name that other containers resolve.
     restart: unless-stopped
     expose:
+      # No published host port either: three replicas cannot share one host port.
       - 8080
     mem_limit: 4g
     cpus: 2
@@ -184,11 +188,17 @@ back - one failed request instead of four.
       - no-new-privileges:true
     volumes:
       - image-fingerprint-tmp:/tmp
-    deploy:
-      replicas: 3
+    scale: 3
 ```
 
-`docker compose up -d --scale image-fingerprint=3` does the same thing without touching the file.
+`scale` is a plain service attribute and is the simplest form. Two equivalents exist:
+`deploy: { replicas: 3 }` (same effect; the `deploy` section carries some historical "Swarm only"
+baggage, and when both are set they must agree), and `docker compose up -d --scale
+image-fingerprint=3`, which changes nothing in the file. There is also `docker compose scale
+image-fingerprint=3` for a running stack.
+
+You get three ordinary containers, named `<project>-<service>-<index>`, so `docker ps` will show
+`myproject-image-fingerprint-1`, `-2` and `-3`.
 
 **No load balancer is needed.** Docker's embedded DNS resolves the service name to all replica
 addresses and shuffles them, so successive lookups land on different containers. Every Nuxeo conversion
@@ -197,7 +207,9 @@ with two replicas: consecutive calls to `http://image-fingerprint:8080/health` a
 `172.20.0.2` and `172.20.0.3`.
 
 Two caveats. The shuffle is **not load-aware** - there is no least-connections logic, so a request can
-land on a busy replica while another sits idle. And this works *because* `curl` is short-lived; a client
+land on a busy replica while another sits idle. The Compose specification is explicit that
+*"exactly which container the name resolves to is not guaranteed"*. And this works *because* `curl` is
+short-lived; a client
 with a persistent connection pool would pin itself to one replica and need a real balancer.
 
 **What a replica buys.** Six concurrent 1 MP requests, `MAX_CONCURRENT=1`, `cpus: 2` each:
@@ -221,6 +233,148 @@ queue wait  ~=  (position in queue - 1)  x  per-image time
 
 At ~0.66 s per 24 MP image, one replica absorbs a burst of roughly 120 queued requests before the
 client's 80 s deadline is at risk. Past that, add replicas rather than stretching the timeouts.
+
+## Deploying as a shared service
+
+Everything above assumes the sidecar layout of `README.md`: the service runs in the same Compose
+project as Nuxeo. That is the right shape for a demo, a proof of concept and a single-node install.
+
+For a **cluster of several Nuxeo nodes** it is usually the wrong shape, and the reason is not the idle
+cost - 450 MB per node is noise on a Nuxeo box. It is the **headroom you have to reserve**:
+
+| Layout, 4 Nuxeo nodes | RAM reserved for fingerprinting | Actually used |
+|---|---|---|
+| A sidecar on every node | 4 x 2.7 GB = **~11 GB** | rarely, and never on more than one node at a time |
+| Shared, 2 instances (HA) | **5.4 GB** | the same work |
+| Shared, 1 instance | **2.7 GB** | the same work |
+
+With sidecars you reserve peak capacity on *every* node for something that runs occasionally, and an
+idle container on node 1 cannot absorb a burst on node 2. Deployed on its own, the capacity is pooled.
+This is the same reasoning that puts MongoDB and OpenSearch on their own hosts.
+
+It also makes a temporary scale-up practical: for a one-off campaign over thousands of images, scale
+the shared service up and back down again. Doing that to a sidecar on every Nuxeo node is far more
+work.
+
+The service is **stateless** - no database, no shared volume, and the model weights are baked into the
+image - so there is nothing to coordinate. Point several Nuxeo nodes at one endpoint and it works.
+
+### Making the service URL configurable
+
+`README.md` hardcodes `http://image-fingerprint:8080` in the command lines, which keeps the quick
+start readable. For any other topology, replace the URL with a property:
+
+```xml
+<parameterString>-sS --fail-with-body --max-time 80 -H "Expect:" -o #{outDirPath}/nxblob-fingerprinted.jpg --data-binary @#{sourceFilePath} "${nuxeo.fingerprint.baseurl:=http://image-fingerprint:8080}/embed?format=jpeg&amp;payload=#{payload}"</parameterString>
+```
+
+Then in `nuxeo.conf`:
+
+```
+nuxeo.fingerprint.baseurl=https://fingerprint.internal.example.com
+```
+
+Keep the **scheme inside the property**, not just host and port: moving to HTTPS then becomes a
+configuration change rather than an XML edit.
+
+This version is **backward compatible**. The `:=` default is the Compose service name, so with no
+`nuxeo.conf` entry at all it behaves exactly like the hardcoded one - you can adopt it from the start
+and decide on the topology later.
+
+Why this works, since it is not obvious: Nuxeo reads a contribution file **as a whole string and
+expands `${...}` before parsing the XML** (`DefaultRuntimeContext.createRegistrationInfo` calls
+`Framework.expandVars` on the source). The substitution therefore happens before `ShellExecutor`
+tokenises the parameter string, so it cannot interfere with the quoting rules. The same
+`${property:=default}` form is used by the platform's own contributions.
+
+### Security
+
+The trust boundary changes. As a sidecar, only containers in the same Compose project could reach the
+service. Off-box, anything that can route to the port can use it - and the service still has **no
+authentication**.
+
+- Restrict the security group to **the Nuxeo instances' security group** on port 8080. That is the
+  control that replaces the Docker network boundary, and it is the one that matters.
+- Never give it a public address or a public load balancer. It belongs on a private subnet, reached
+  the same way Nuxeo reaches MongoDB or OpenSearch.
+- Keep everything the container already does: non-root, read-only filesystem, dropped capabilities,
+  and the upload, pixel and concurrency limits.
+
+Remember what `/decode` gives away: anyone who can reach it can test whether an image carries a
+fingerprint and read the token out of it. For a forensic watermark that is the whole secret.
+
+### The payload travels in the query string
+
+`?payload=K7Q2M9XA` is convenient and needs no escaping, and as a sidecar nothing sat between Nuxeo
+and the service. Once there is a load balancer or a reverse proxy in the path, that changes: **the
+full request line, query string included, lands in its access log.**
+
+The service itself never logs the payload - that is deliberate, the token-to-recipient mapping belongs
+in Nuxeo. Intermediaries have no such scruples.
+
+So when a load balancer is involved, either turn off or sanitise its access logs, or accept that the
+tokens are recorded there. This is the main argument for TLS on this hop, more than eavesdropping is.
+
+### Does it need HTTPS?
+
+Not strictly - by the same standard that Nuxeo talks to MongoDB and OpenSearch in plain text inside a
+private network, which is what most deployments do.
+
+- **No load balancer, tight security group, same availability zone**: plain HTTP is defensible, and is
+  the same posture as the MongoDB link.
+- **Anything in between**: use TLS, or deal with the access-log point above.
+- **A compliance context**: use TLS. "The hypervisor encrypts traffic between instances" may well be
+  true of your instance types, but it is an infrastructure property an auditor cannot see, whereas TLS
+  is visible and provable.
+
+TLS terminates at the load balancer or at a reverse proxy in front of the service. The service itself
+speaks plain HTTP and has no TLS configuration - keep it that way.
+
+### One more link in the timeout chain
+
+A load balancer adds its own timeout, and the defaults collide with ours. **An AWS ALB idles out at
+60 seconds, and `CONVERT_TIMEOUT_S` is also 60.** Between the client finishing its upload and the
+service answering, no data flows, which an ALB counts as idle. It can therefore return *its* 504
+before the service's plain-text 504 arrives - destroying exactly the error reporting the timeout chain
+exists to preserve.
+
+Make the load balancer timeout longer than anything the client will wait for:
+
+```
+CONVERT_TIMEOUT_S (60)  <  curl --max-time (80)  <=  LB idle timeout (120)  <  <timeout> (90s)*
+```
+
+\* with the caveat that `<timeout>` must still be under the transaction timeout. The simplest rule:
+set the load balancer well clear of the chain, for example 120 s, so it never fires first. A network
+load balancer avoids the problem differently, as it does not apply an HTTP idle timeout.
+
+### Getting the image onto the host
+
+The repository ships source; each user builds their own image. For a standalone deployment either
+build on the target host, or build once and push to a private registry such as ECR.
+
+Pushing to a private registry is **unencumbered here**: every component in the image is permissively
+licensed (MIT / BSD / Apache-2.0 / PSF), so there is no copyleft source-offer obligation. See
+`image-fingerprint/THIRD-PARTY-NOTICES.md`.
+
+Health checks move from Docker's `HEALTHCHECK` to whatever the platform uses. `GET /health` is already
+suitable for a load balancer health check: it returns 200 with
+`{"status":"ok","trustmark":"0.9.2","model":"Q"}` only once the model is loaded and the service is
+ready to work.
+
+> [!WARNING]
+> **Do not put this on a scale-to-zero platform** for synchronous calls. The image is about 1.12 GB
+> and the model takes roughly 3 seconds to load, so a cold start is far too slow for an operation a
+> user is waiting on. Keep at least one instance warm.
+
+### Which layout to choose
+
+| Situation | Layout |
+|---|---|
+| Demo, proof of concept, single Nuxeo node | **Sidecar**, exactly as `README.md` describes. No extra operational surface |
+| Cluster of 3-4 nodes, occasional fingerprinting | **Shared, 2 instances** behind an internal load balancer. Reserves 5.4 GB once instead of ~11 GB spread thin, and survives losing one |
+| Cluster, shared, single instance | Works, and is cheap - but it is a cluster-wide single point of failure. Combined with the retry findings below, an outage means fingerprints are silently lost |
+| One-off campaign over thousands of images | Shared, scaled up temporarily, then back down. Pair it with the Bulk Action Framework, see [Calling it asynchronously](#calling-it-asynchronously) |
 
 
 ## Calling it asynchronously

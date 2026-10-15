@@ -27,6 +27,11 @@ not work. `samples/` and `README.md` stay at the root and are not part of the im
 
 - No CI, no test suite, no build step for the repository itself. The only verification is the
   "Build, run, verify" procedure below; don't look for a Makefile, a workflow or a package manifest.
+- **`README.md` is the quick start and must stay that way.** It documents one topology - the Compose
+  sidecar - with a hardcoded service URL, because that reads better for someone getting started.
+  Tuning, sizing, scaling, alternative topologies and async invocation all belong in
+  `README-Running-at-scale.md`. Don't grow `README.md` with that material; add to the other file and
+  rely on the pointers that already link the two.
 - `AGENTS.md` is committed on purpose here and must **not** be added to `.gitignore`.
 - Work happens directly on `master`, and `README.md` still carries a work-in-progress banner. Don't
   remove that banner on your own initiative.
@@ -318,5 +323,35 @@ reading `AbstractWork` again:
     (`nuxeo.db.transactiontimeout`, 300s by default). `<timeout>` is parsed as a `Duration`, so its
     unit is mandatory (`90s`, not `90`), and Nuxeo enforces
     `min(<timeout>, remaining transaction TTL)` by prefixing the command with `timeout -s 9`.
-- Publishing images to a registry. This repository ships source; the licensing allows redistribution
-  but nothing here is set up to publish.
+    When a load balancer sits in front of the service it adds a link to that chain: an AWS ALB idles
+    out at **60s by default, the same value as `CONVERT_TIMEOUT_S`**, and would return its own 504
+    instead of the service's plain-text one. Documented in `README-Running-at-scale.md`.
+
+## Deployment topologies
+
+Two are supported, and the documentation splits along that line:
+
+- **Sidecar** (`README.md`): the service runs in Nuxeo's Compose project and the command lines
+  hardcode `http://image-fingerprint:8080`. Keep it hardcoded there - it reads better for a quick
+  start.
+- **Shared / standalone** (`README-Running-at-scale.md`): one service for several Nuxeo nodes. The
+  same contribution with the URL replaced by
+  `${nuxeo.fingerprint.baseurl:=http://image-fingerprint:8080}`, repointed with one `nuxeo.conf`
+  line. The `:=` default makes it behave identically as a sidecar, so the two versions are
+  interchangeable.
+- **Why the property works**: `DefaultRuntimeContext.createRegistrationInfo` reads a contribution
+  file as a whole string and runs `Framework.expandVars` on it **before parsing the XML**, so
+  `${prop:=default}` works anywhere in a contribution, including inside `<parameterString>` - and the
+  substitution happens before `ShellExecutor` tokenises, so it cannot break the quoting.
+- The service is stateless (no DB, no shared volume, weights baked into the image), so sharing it
+  across nodes needs no coordination. The argument for sharing is the **reserved headroom**: a
+  sidecar per node reserves peak memory on every node for work that runs rarely.
+- **Compose scaling facts**, verified against the specification: `scale: N` is a plain service
+  attribute and the simplest form (`deploy.replicas` and `--scale` are equivalents). A
+  `container_name` makes Compose **refuse** to scale - that is a hard error. A `hostname` does not;
+  it is merely pointless, since every replica would share it. Don't conflate the two, as an earlier
+  version of the docs did.
+- **Getting the image to a standalone host**: build on the target, or build once and push to a
+  private registry. Permitted - every component is permissively licensed, so there is no
+  source-offer obligation - but nothing in this repository is set up to publish, and that stays out
+  of scope.
