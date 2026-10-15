@@ -373,8 +373,22 @@ ready to work.
 |---|---|
 | Demo, proof of concept, single Nuxeo node | **Sidecar**, exactly as `README.md` describes. No extra operational surface |
 | Cluster of 3-4 nodes, occasional fingerprinting | **Shared, 2 instances** behind an internal load balancer. Reserves 5.4 GB once instead of ~11 GB spread thin, and survives losing one |
-| Cluster, shared, single instance | Works, and is cheap - but it is a cluster-wide single point of failure. Combined with the retry findings below, an outage means fingerprints are silently lost |
+| Cluster, shared, single instance | Works, and is cheap, but it is a cluster-wide single point of failure. How badly that bites depends on *how* you call it - see the note below |
 | One-off campaign over thousands of images | Shared, scaled up temporarily, then back down. Pair it with the Bulk Action Framework, see [Calling it asynchronously](#calling-it-asynchronously) |
+
+**How a failure shows up depends on the combination.** The topology decides *how much* breaks; the
+invocation style decides whether you ever find out.
+
+| How you call it | A fingerprinting outage looks like |
+|---|---|
+| Synchronously (`Blob.RunConverter`, the default) | The operation fails immediately, with the service's plain-text error. Loud, and in front of whoever triggered it |
+| Async post-commit handler | **Silent.** The user's action succeeded, the three retries are spent in 48 ms, and nothing reaches the caller |
+| Bulk Action Framework | Visible as `errorCount` in the command status, and with `failOnError=true` it retries with backoff and usually recovers |
+
+The one combination to avoid is **a single shared instance, called from an async post-commit handler,
+without Kafka**: the whole cluster depends on one container, nothing retries usefully, and nobody is
+told. Running two instances, using the Bulk Action Framework, or keeping the call synchronous - any
+one of the three removes the trap.
 
 
 ## Calling it asynchronously
@@ -391,8 +405,8 @@ LTS 2025 instance**, not just read in the sources.
 
 | Your flow | Recommendation |
 |---|---|
-| Fingerprint on publish, the user waits, the file must be fingerprinted before it is delivered | **Stay synchronous.** An embed takes well under a second. Asynchronous processing only adds eventual-consistency complexity to something the user is waiting for |
-| Fingerprint on publish, but delivery is a separate, later step | **Asynchronous is a clear win.** Publishing stops depending on a sidecar container being up |
+| Fingerprint on publish, the user waits, the file must be fingerprinted before it is delivered | **Stay synchronous.** An embed takes well under a second, and a failure is reported to the caller instead of disappearing. Asynchronous processing only adds eventual-consistency complexity to something the user is waiting for |
+| Fingerprint on publish, but delivery is a separate, later step | **Asynchronous is a clear win.** Publishing stops depending on the service being up - but see what a failure then looks like, because nobody is told |
 | "Send these 500 images to a partner, each with its own token" | **Bulk Action Framework**, see below |
 
 Fingerprinting is normally applied only to the renditions you publish or send, so the volumes are
